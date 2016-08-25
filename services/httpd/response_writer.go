@@ -1,14 +1,18 @@
 package httpd
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
+	"github.com/ugorji/go/codec"
 )
 
 // ResponseWriter is an interface for writing a response.
@@ -28,6 +32,9 @@ func NewResponseWriter(w http.ResponseWriter, r *http.Request) ResponseWriter {
 	case "application/csv", "text/csv":
 		w.Header().Add("Content-Type", "text/csv")
 		rw.formatter = &csvFormatter{statementID: -1, Writer: w}
+	case "application/x-msgpack":
+		w.Header().Add("Content-Type", "application/x-msgpack")
+		rw.formatter = newMsgpackFormatter(w)
 	case "application/json":
 		fallthrough
 	default:
@@ -102,7 +109,8 @@ type csvFormatter struct {
 }
 
 func (w *csvFormatter) WriteResponse(resp Response) (n int, err error) {
-	csv := csv.NewWriter(w)
+	csv := csv.NewWriter(writer{Writer: w, n: &n})
+	defer csv.Flush()
 	for _, result := range resp.Results {
 		if result.StatementID != w.statementID {
 			// If there are no series in the result, skip past this result.
@@ -171,4 +179,74 @@ func (w *csvFormatter) WriteResponse(resp Response) (n int, err error) {
 		return n, err
 	}
 	return n, nil
+}
+
+type msgpackTimeExt struct {
+	enc *codec.Encoder
+	buf bytes.Buffer
+}
+
+func newMsgpackTimeExt(h *codec.MsgpackHandle) *msgpackTimeExt {
+	ext := &msgpackTimeExt{}
+	ext.enc = codec.NewEncoder(&ext.buf, h)
+	return ext
+}
+
+func (x *msgpackTimeExt) WriteExt(v interface{}) (data []byte) {
+	var t time.Time
+	switch v := v.(type) {
+	case time.Time:
+		t = v
+	case *time.Time:
+		t = *v
+	default:
+		panic(fmt.Sprintf("unsupported format for time conversion: expecting time.Time, got %T", v))
+	}
+
+	// The codec library does not expose encoding to a byte string directly so
+	// we use our own encoder to encode an int. We reuse the internal buffer to
+	// reduce the number of allocations. This makes this extension
+	// non-threadsafe, but we make a new extension writer every time we create
+	// an encoder so this shouldn't matter.
+	x.buf.Reset()
+	x.enc.MustEncode(t.UnixNano())
+	return x.buf.Bytes()
+}
+
+func (x *msgpackTimeExt) ReadExt(dst interface{}, src []byte) { panic("unsupported") }
+
+type msgpackFormatter struct {
+	io.Writer
+	enc *codec.Encoder
+	w   bytes.Buffer
+}
+
+func newMsgpackFormatter(w io.Writer) *msgpackFormatter {
+	var mh codec.MsgpackHandle
+	mh.WriteExt = true
+	mh.SetBytesExt(reflect.TypeOf(time.Time{}), 1, newMsgpackTimeExt(&mh))
+
+	mf := &msgpackFormatter{Writer: w}
+	mf.enc = codec.NewEncoder(&mf.w, &mh)
+	return mf
+}
+
+func (w *msgpackFormatter) WriteResponse(resp Response) (n int, err error) {
+	if err := w.enc.Encode(resp); err != nil {
+		return 0, err
+	}
+	n, err = w.Writer.Write(w.w.Bytes())
+	w.w.Reset()
+	return
+}
+
+type writer struct {
+	io.Writer
+	n *int
+}
+
+func (w writer) Write(data []byte) (n int, err error) {
+	n, err = w.Writer.Write(data)
+	*w.n += n
+	return n, err
 }
